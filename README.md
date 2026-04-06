@@ -1,12 +1,17 @@
 # Birka Memory Vault
 
-Built March 2026 as a structured memory layer for autonomous agents. Designed to solve the stateless session problem — agents that forget everything between runs.
+Persistent, structured memory for LLM agents.
+
+SQLAlchemy 2.0 + SQLite/PostgreSQL memory layer that gives autonomous agents queryable long-term memory across sessions. No embeddings. No RAG. No vector databases.
+
+Built March 2026 — before Karpathy's LLM knowledge base paper, this solved the stateless session problem.
 
 ---
 
 ## The Problem
 
-Agents run, produce output, exit. Their memory vanishes. Rebuilding context from raw files is slow, error-prone, and impossible to query.
+LLM agents are stateless. Every session restart = memory gone.
+You can't ask "what did the agent decide last week?" or "which tasks failed?" without parsing raw logs.
 
 ---
 
@@ -18,11 +23,13 @@ Keep raw Markdown as the source of truth. Add a **parallel structured index** th
 
 ## Why This Exists
 
-- Queryable memory: find all decisions about a project in the last week
-- Relationships: see which agent produced which artifact, which mission spawned which memory
-- Compaction trace: track how daily logs were merged into curated summaries
-- Capability orchestration: know which agent can do what
-- Works across restarts, deployments, and multiple concurrent instances
+- **Queryable agent memory** — find all decisions, tasks, artifacts by project, date, or type
+- **Graph relationships** — see which agent produced which artifact, which mission spawned which memory, dependency chains
+- **Compaction trace** — track how daily logs were merged into curated summaries (full lineage)
+- **Capability orchestration** — know which Birka instance can run which tools; route work accordingly
+- **State persistence across restarts** — solves the core LLM agent statelessness problem without retraining
+
+This is **agentic memory management** for production autonomous systems.
 
 ---
 
@@ -30,18 +37,18 @@ Keep raw Markdown as the source of truth. Add a **parallel structured index** th
 
 Three foundation tables + nine orchestrator tables:
 
-- **memory_entry** — indexed memories with tags and source file
-- **compaction_index** — lineage of merged memories
-- **snapshot_index** — periodic state checkpoints
+- **memory_entry** — indexed memories with tags, source file, created_at
+- **compaction_index** — which raw entries merged into which curated memory
+- **snapshot_index** — periodic memory state checkpoints (hash + entry list)
 
-- **nodes** — universal typed entities (agent, mission, artifact, memory, file, user, context)
+- **nodes** — universal typed entities (agent, mission, artifact, memory, context, file, user)
 - **edges** — typed relations (SPAWNED_BY, PRODUCES, REFERENCES, CONTAINS, DERIVED_FROM, BLOCKS, DEPENDS_ON)
-- **missions** — dispatched work units with lifecycle tracking
-- **birka_fleet** — all running agent instances with capabilities and heartbeats
-- **spawn_tree** — full delegation tree with depth tracking
+- **missions** — dispatched work units (status, priority, result, error, token count)
+- **birka_fleet** — all running agent instances (model, capabilities, heartbeats, spawn depth)
+- **spawn_tree** — full delegation tree with depth limits
 - **resource_manifest** — declared capabilities parsed from TOOLS.md/SOUL.md
 - **control_commands** — signed commands (PAUSE, KILL, OVERRIDE_MODEL, DRAIN, SYNC)
-- **safeguard_events** — circuit breaker events (loops, cost ceiling, timeout)
+- **safeguard_events** — circuit breaker events (loops, cost ceiling, timeout, error rate)
 - **events** — append-only audit log (spawn, dispatch, command, safeguard, state_change, error, metric)
 
 ---
@@ -55,21 +62,22 @@ pip install -r requirements.txt
 alembic upgrade head
 ```
 
-Default database is SQLite (`sqlite+aiosqlite:///./birka_memory.db`). For production, set `DATABASE_URL` to PostgreSQL.
+Default database: SQLite (`sqlite+aiosqlite:///./birka_memory.db`). For production, set `DATABASE_URL` to PostgreSQL (`postgresql+asyncpg://...`).
 
 ---
 
 ## Integration
 
 ```python
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from birka_memory_vault.database import AsyncSessionLocal, init_db
 from birka_memory_vault.events import MemoryEventManager
+from birka_memory_vault.schemas import MemoryEntryCreate, NodeCreate, EdgeCreate
+from birka_memory_vault.models import NodeType, EdgeType
 
 await init_db()
 
 # Index a memory entry
-from birka_memory_vault.schemas import MemoryEntryCreate
 async with AsyncSessionLocal() as session:
     mgr = MemoryEventManager(session)
     await mgr.add_memory_entry(MemoryEntryCreate(
@@ -80,19 +88,54 @@ async with AsyncSessionLocal() as session:
         source_file="memory/2026-04-06.md"
     ))
 
-# Create nodes and edges
-from birka_memory_vault.schemas import NodeCreate, EdgeCreate
-from birka_memory_vault.models import NodeType, EdgeType
-
-async with AsyncSessionLocal() as session:
-    mgr = MemoryEventManager(session)
-    file_node = await mgr.create_node(NodeCreate(type=NodeType.FILE.value, name="memory/2026-04-06.md"))
-    entry = await mgr.add_memory_entry(MemoryEntryCreate(type="decision", title="...", content="...", tags=["..."], source_file="memory/2026-04-06.md"))
-    await mgr.create_edge(EdgeCreate(source_id=file_node.id, target_id=entry.id, type=EdgeType.CONTAINS.value))
-    await session.commit()
+# Create node and edge
+file_node = await mgr.create_node(NodeCreate(type=NodeType.FILE.value, name="memory/2026-04-06.md"))
+entry = await mgr.add_memory_entry(MemoryEntryCreate(...))
+await mgr.create_edge(EdgeCreate(source_id=file_node.id, target_id=entry.id, type=EdgeType.CONTAINS.value))
+await session.commit()
 ```
 
 See `examples/` for mission tracking, snapshots, safeguards, and audit logging.
+
+---
+
+## Alembic Migrations
+
+Migrations in `alembic/versions/`. Initial revision creates all 12 tables.
+
+```bash
+alembic revision --autogenerate -m "Add new field"
+alembic upgrade head
+```
+
+Always test migrations on a copy of the dev DB.
+
+---
+
+## Querying
+
+Graph queries let you trace the full agent universe:
+
+```python
+# Active missions for Birka instance 'birka-1'
+result = await session.execute(select(Mission).where(Mission.node_id == 'birka-1', Mission.status == MissionStatus.IN_PROGRESS))
+
+# Spawn tree depth for a Birka
+depth = await session.execute(select(func.max(SpawnTree.depth)).where(SpawnTree.parent_instance_id == 'birka-1'))
+
+# All memory references to file 'foo.md'
+refs = await session.execute(select(Edge).where(Edge.type == EdgeType.REFERENCES, Edge.target_id == ...))
+```
+
+---
+
+## Event Flow
+
+1. Agent writes `memory/YYYY-MM-DD.md` and/or updates `MEMORY.md`
+2. Agent also calls `MemoryEventManager` to insert rows into `memory_entry` and create `Node`/`Edge` entries
+3. On compaction (daily), `compaction_index` links curated entry to raw entries it merged
+4. Snapshots (`snapshot_index`) capture global state at milestones
+5. Orchestrator events (spawns, commands, safeguards) written to dedicated tables
 
 ---
 
@@ -114,9 +157,9 @@ birka-memory-vault/
 ## Production Notes
 
 - Use PostgreSQL (`postgresql+asyncpg://`)
-- Partition `events` by month for high volume
+- Partition `events` table by month for high volume
 - Enable connection pooling
-- Nightly backups
+- Nightly backups (pg_dump)
 - Monitor safeguard event rate
 
 ---
